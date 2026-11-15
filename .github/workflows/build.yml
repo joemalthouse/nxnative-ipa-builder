@@ -258,6 +258,10 @@ jobs:
                       tid = int(m.group(1), 16)
                       if (tid & 0xFFF) == 0:
                           candidates.add(f"{tid:016X}")
+                      elif (tid & 0xFFF) == 0x800:
+                          # update ticket: base title ID is the same with the low 12 bits cleared
+                          # (covers base NSPs shipped without a ticket)
+                          candidates.add(f"{tid & ~0xFFF:016X}")
 
           if len(candidates) != 1:
               raise SystemExit(
