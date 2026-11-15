@@ -46,10 +46,8 @@ jobs:
           AVAIL_GB="$(df -g / | awk 'NR==2{print $4}')"
           echo "Free space: ${AVAIL_GB} GB"
           if [ "${AVAIL_GB:-0}" -lt 45 ]; then
-            echo "Low disk; removing unused Xcode versions and simulators"
+            echo "Low disk; removing unused Xcode versions"
             sudo rm -rf /Applications/Xcode_27.0.app /Applications/Xcode_27.1.app || true
-            xcrun simctl delete all || true
-            sudo rm -rf /Library/Developer/CoreSimulator/Volumes/* || true
             df -h / || true
           fi
 
@@ -62,7 +60,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          brew install xcodegen zstd
+          brew install xcodegen zstd glslang
           python -m pip install --upgrade pip
           python -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic backports.zstd gdown
           python -c "import lz4.block, capstone, fontTools, zbic, gdown; print('python modules OK, capstone', capstone.__version__)"
@@ -77,6 +75,17 @@ jobs:
           xcrun -sdk macosx metal --version
           python3 dm/gfx/tools/own_compilers.py --check-metal
           echo "Toolchain matches the lock."
+
+          # Mirror build_ipa_from_nsp.py's check_prereqs now, so a gap fails in a minute, not after the download.
+          for t in xcodebuild xcodegen zstd make glslangValidator; do
+            command -v "$t" >/dev/null || { echo "::error::prerequisite missing: $t"; exit 1; }
+          done
+          dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate --source-sha
+          rc=0; dm/gfx/tools/spirv_cross_bin/spirv-cross --help >/dev/null 2>&1 || rc=$?
+          [ "$rc" -lt 126 ] || { echo "::error::spirv-cross cannot execute (exit $rc)"; exit 1; }
+          python -c "import compression.zstd" 2>/dev/null || python -c "import backports.zstd"
+          python -c "import capstone; assert capstone.cs_version()[0]==5"
+          echo "Prerequisites OK."
 
       - name: Download game files and keys
         env:
