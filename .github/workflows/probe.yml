@@ -1,0 +1,22 @@
+name: Disk probe
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: xcode-27
+    timeout-minutes: 20
+    steps:
+      - name: Measure disk and removable space
+        shell: bash
+        run: |
+          df -h / /System/Volumes/Data "$RUNNER_TEMP" || true
+          echo "cores: $(sysctl -n hw.ncpu)  mem: $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
+          ls -d /Applications/Xcode* || true
+          for d in /Applications/Xcode_* "$HOME/Library/Android" /usr/local/share/dotnet "$HOME/.dotnet" /usr/local/lib/node_modules "$HOME/hostedtoolcache" /Users/runner/hostedtoolcache "$HOME/Library/Developer/CoreSimulator" /Library/Developer/CoreSimulator /opt/homebrew /usr/local/Homebrew "$HOME/.ghcup" "$HOME/.rustup" "$HOME/.cargo" /usr/local/aws-cli /usr/local/miniconda /opt/miniconda; do
+            [ -e "$d" ] && echo "$(du -sh "$d" 2>/dev/null | cut -f1)  $d"
+          done
+          xcrun simctl runtime list 2>/dev/null | head -20 || true
+          echo "--- try removing Android SDK + dotnet + toolcache + other Xcodes (timed)"
+          time sudo rm -rf "$HOME/Library/Android" /usr/local/share/dotnet "$HOME/.dotnet" /Users/runner/hostedtoolcache/CodeQL $(ls -d /Applications/Xcode_* | grep -v 'Xcode_27.2.app') 2>/dev/null || true
+          df -h / /System/Volumes/Data || true
