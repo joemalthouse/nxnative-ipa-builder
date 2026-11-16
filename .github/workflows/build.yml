@@ -1,4 +1,4 @@
-name: NxNative - Wonder IPA Builder
+name: NxNative IPA Builder
 
 # Reworked from the community "universal" workflow. Fixes: (1) Xcode 27.2 + its Metal toolchain, which
 # the pinned nxnative lock requires (macos-latest has Xcode 26.6); (2) zbic installed (the build script
@@ -14,6 +14,12 @@ on:
         required: false
         type: string
         default: ""
+      romfs:
+        description: "bundle = game files inside the IPA; separate = small IPA + RomFS.img pushed to the device over USB"
+        required: false
+        type: choice
+        options: [bundle, separate]
+        default: separate
 
 permissions:
   contents: read
@@ -45,11 +51,13 @@ jobs:
           df -h / "$RUNNER_TEMP" || true
           AVAIL_GB="$(df -g / | awk 'NR==2{print $4}')"
           echo "Free space: ${AVAIL_GB} GB"
-          if [ "${AVAIL_GB:-0}" -lt 45 ]; then
-            echo "Low disk; removing unused Xcode versions"
-            sudo rm -rf /Applications/Xcode_27.0.app /Applications/Xcode_27.1.app || true
-            df -h / || true
-          fi
+          echo "Freeing disk: Android SDK, .NET, CodeQL, other Xcode versions (~29 GB, ~3 min)"
+          sudo rm -rf "$HOME/Library/Android" /usr/local/share/dotnet "$HOME/.dotnet" "$RUNNER_TOOL_CACHE/CodeQL" \
+            $(ls -d /Applications/Xcode_* | grep -v '^/Applications/Xcode_27.2.app$') 2>/dev/null || true
+          test -d "$DEVELOPER_DIR" || { echo "::error::cleanup removed Xcode 27.2"; exit 1; }
+          AVAIL_GB="$(df -g / | awk 'NR==2{print $4}')"
+          echo "Free space after cleanup: ${AVAIL_GB} GB"
+          [ "${AVAIL_GB:-0}" -ge 50 ] || { echo "::error::only ${AVAIL_GB} GB free after cleanup (need 50 for a large game)"; exit 1; }
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -286,50 +294,133 @@ jobs:
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
 
       - name: Build unsigned IPA
+        env:
+          ROMFS_MODE: ${{ inputs.romfs || 'separate' }}
         shell: bash
         run: |
           set -euo pipefail
           WORK="$RUNNER_TEMP/nxnative"
           GAME_DIR="$RUNNER_TEMP/GameFiles"
           OUTPUT="$RUNNER_TEMP/NxNative.ipa"
+          LOG="$RUNNER_TEMP/build.log"
 
           python scripts/build_ipa_from_nsp.py \
             "$GAME_DIR" \
             -k "$WORK/prod.keys" \
-            -o "$OUTPUT"
+            -o "$OUTPUT" \
+            --romfs "$ROMFS_MODE" --keep-extracted 2>&1 | tee "$LOG"
 
           if [[ ! -s "$OUTPUT" ]]; then
             echo "::error::IPA build did not produce an output file."
             exit 1
           fi
-
           echo "IPA successfully created: $OUTPUT"
           ls -lh "$OUTPUT"
 
-      - name: Encrypt IPA (only if IPA_PASSPHRASE secret is set)
+          if [[ "$ROMFS_MODE" == separate ]]; then
+            IMG="$(sed -n 's/.*the image stays at //p' "$LOG" | tail -1)"
+            if [[ ! -f "$IMG" ]]; then
+              C="$(find "$GAME_DIR" -path '*/extract/*' -name RomFS.img -type f)"
+              [[ -n "$C" && "$(printf '%s\n' "$C" | wc -l | tr -d ' ')" -eq 1 ]] || { echo "::error::cannot locate the RomFS image (candidates: ${C:-none})"; exit 1; }
+              IMG="$C"
+            fi
+            echo "RomFS image: $IMG"; ls -lh "$IMG"
+            echo "ROMFS_IMG=$IMG" >> "$GITHUB_ENV"
+          fi
+          # the NSPs are no longer needed: free their space before encryption
+          find "$GAME_DIR" -maxdepth 1 -type f \( -name '*.nsp' -o -name '*.xci' \) -delete
+          df -h / || true
+
+      - name: Encrypt outputs
         env:
           IPA_PASSPHRASE: ${{ secrets.IPA_PASSPHRASE }}
         shell: bash
         run: |
           set -euo pipefail
+          [[ -n "${IPA_PASSPHRASE:-}" ]] || { echo "::error::IPA_PASSPHRASE is not set (the repo is public: outputs must be encrypted)"; exit 1; }
           IPA="$RUNNER_TEMP/NxNative.ipa"
-          if [[ -n "${IPA_PASSPHRASE:-}" ]]; then
-            /usr/bin/openssl enc -aes-256-cbc -pbkdf2 -salt -in "$IPA" -out "$IPA.enc" -pass env:IPA_PASSPHRASE
-            rm -f "$IPA"
-            ls -lh "$IPA.enc"
-            echo "UPLOAD_PATH=$IPA.enc" >> "$GITHUB_ENV"
-            echo "UPLOAD_NAME=NxNative-IPA-encrypted" >> "$GITHUB_ENV"
-          else
-            echo "UPLOAD_PATH=$IPA" >> "$GITHUB_ENV"
-            echo "UPLOAD_NAME=NxNative-IPA" >> "$GITHUB_ENV"
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT/ipa" "$OUT/romfs"
+          shasum -a 256 "$IPA" | awk '{print $1"  NxNative.ipa"}' > "$OUT/ipa/SHA256SUMS"
+          /usr/bin/openssl enc -aes-256-cbc -pbkdf2 -salt -in "$IPA" -out "$OUT/ipa/NxNative.ipa.enc" -pass env:IPA_PASSPHRASE
+          rm -f "$IPA"
+          PARTS=0
+          if [[ -n "${ROMFS_IMG:-}" ]]; then
+            shasum -a 256 "$ROMFS_IMG" | awk '{print $1"  RomFS.img"}' >> "$OUT/ipa/SHA256SUMS"
+            # one encrypted stream split in 3 GiB parts (each its own artifact, so a failed download is retried per part)
+            /usr/bin/openssl enc -aes-256-cbc -pbkdf2 -salt -in "$ROMFS_IMG" -pass env:IPA_PASSPHRASE | split -a 1 -b 3072m - "$OUT/romfs/RomFS.img.enc.part_"
+            rm -f "$ROMFS_IMG"
+            PARTS="$(ls "$OUT/romfs" | wc -l | tr -d ' ')"
+            [[ "$PARTS" -le 6 ]] || { echo "::error::$PARTS parts, the workflow uploads at most 6"; exit 1; }
+            for f in "$OUT"/romfs/*; do mkdir -p "$f.d"; mv "$f" "$f.d/"; done
           fi
+          echo "PARTS=$PARTS" >> "$GITHUB_ENV"
+          cat "$OUT/ipa/SHA256SUMS"; ls -lhR "$OUT"
 
       - name: Upload IPA
-        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.UPLOAD_NAME }}
-          path: ${{ env.UPLOAD_PATH }}
+          name: NxNative-IPA-encrypted
+          path: ${{ runner.temp }}/out/ipa/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload RomFS part a
+        if: success() && env.PARTS >= 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: RomFS-part-a
+          path: ${{ runner.temp }}/out/romfs/RomFS.img.enc.part_a.d/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload RomFS part b
+        if: success() && env.PARTS >= 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: RomFS-part-b
+          path: ${{ runner.temp }}/out/romfs/RomFS.img.enc.part_b.d/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload RomFS part c
+        if: success() && env.PARTS >= 3
+        uses: actions/upload-artifact@v4
+        with:
+          name: RomFS-part-c
+          path: ${{ runner.temp }}/out/romfs/RomFS.img.enc.part_c.d/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload RomFS part d
+        if: success() && env.PARTS >= 4
+        uses: actions/upload-artifact@v4
+        with:
+          name: RomFS-part-d
+          path: ${{ runner.temp }}/out/romfs/RomFS.img.enc.part_d.d/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload RomFS part e
+        if: success() && env.PARTS >= 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: RomFS-part-e
+          path: ${{ runner.temp }}/out/romfs/RomFS.img.enc.part_e.d/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload RomFS part f
+        if: success() && env.PARTS >= 6
+        uses: actions/upload-artifact@v4
+        with:
+          name: RomFS-part-f
+          path: ${{ runner.temp }}/out/romfs/RomFS.img.enc.part_f.d/
           if-no-files-found: error
           compression-level: 0
           retention-days: 3
@@ -348,4 +439,4 @@ jobs:
         if: always()
         shell: bash
         run: |
-          rm -rf "$RUNNER_TEMP/nxnative" "$RUNNER_TEMP/GameFiles" "$RUNNER_TEMP/NxNative.ipa" "$RUNNER_TEMP/NxNative.ipa.enc"
+          rm -rf "$RUNNER_TEMP/nxnative" "$RUNNER_TEMP/GameFiles" "$RUNNER_TEMP/NxNative.ipa" "$RUNNER_TEMP/out"
